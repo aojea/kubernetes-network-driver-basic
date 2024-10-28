@@ -3,7 +3,7 @@ module github.com/aojea/dra-network-driver-template
 go 1.22.0
 
 require (
-	github.com/containerd/nri v0.6.1
+	github.com/containerd/nri v0.7.0
 	golang.org/x/sys v0.23.0
 	k8s.io/api v0.30.3
 	k8s.io/apimachinery v0.30.3
@@ -16,7 +16,7 @@ require (
 
 require (
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/containerd/ttrpc v1.2.5 // indirect
+	github.com/containerd/ttrpc v1.2.6-0.20240827082320-b5cd6e4b3287 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.12.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
