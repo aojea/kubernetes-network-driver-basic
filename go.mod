@@ -5,10 +5,10 @@ go 1.22.0
 require (
 	github.com/containerd/nri v0.6.1
 	golang.org/x/sys v0.23.0
-	k8s.io/api v0.30.3
-	k8s.io/apimachinery v0.30.3
-	k8s.io/client-go v0.30.3
-	k8s.io/component-helpers v0.30.3
+	k8s.io/api v0.31.2
+	k8s.io/apimachinery v0.31.2
+	k8s.io/client-go v0.31.2
+	k8s.io/component-helpers v0.31.2
 	k8s.io/dynamic-resource-allocation v0.0.0-00010101000000-000000000000
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubelet v0.0.0
