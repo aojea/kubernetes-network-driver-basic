@@ -4,10 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"sync/atomic"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"golang.org/x/sys/unix"
+
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -15,17 +21,25 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const (
+	driverName = "simple-knd"
+)
+
 var (
 	hostnameOverride string
 	kubeconfig       string
+	bindAddress      string
+
+	ready atomic.Bool
 )
 
 func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file.")
-	flag.StringVar(&hostnameOverride, "hostname-override", "", "If non-empty, will be used as the name of the Node the driver is running on. If unset, the node name is assumed to be the same as the node's hostname.")
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
+	flag.StringVar(&bindAddress, "bind-address", ":9177", "The IP address and port for the metrics and healthz server to serve on")
+	flag.StringVar(&hostnameOverride, "hostname-override", "", "If non-empty, will be used as the name of the Node is running on. If unset, the node name is assumed to be the same as the node's hostname.")
 
 	flag.Usage = func() {
-		fmt.Fprint(os.Stderr, "Usage: dra-network-driver [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", driverName)
 		flag.PrintDefaults()
 	}
 }
@@ -34,13 +48,26 @@ func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 
+	printVersion()
 	flag.VisitAll(func(f *flag.Flag) {
 		klog.Infof("FLAG: --%s=%q", f.Name, f.Value)
 	})
-	os.Exit(run())
-}
 
-func run() int {
+	mux := http.NewServeMux()
+	// Add healthz handler
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+	// Add metrics handler
+	mux.Handle("/metrics", promhttp.Handler())
+	go func() {
+		_ = http.ListenAndServe(bindAddress, mux)
+	}()
+
 	var config *rest.Config
 	var err error
 	if kubeconfig != "" {
@@ -50,8 +77,7 @@ func run() int {
 		config, err = rest.InClusterConfig()
 	}
 	if err != nil {
-		klog.Infof("can not create client-go configuration: %v", err)
-		return 255
+		klog.Fatalf("can not create client-go configuration: %v", err)
 	}
 
 	// use protobuf for better performance at scale
@@ -82,13 +108,14 @@ func run() int {
 	}()
 	signal.Notify(signalCh, os.Interrupt, unix.SIGINT)
 
-	driver, err := Start(ctx, driverName, clientset, nodeName)
-	if err != nil {
-		klog.Infof("driver failed to start: %v", err)
-		return 1
-	}
-	defer driver.Stop()
+	opts := []Option{}
 
+	knd, err := Start(ctx, driverName, clientset, nodeName, opts...)
+	if err != nil {
+		klog.Fatalf("driver failed to start: %v", err)
+	}
+	defer knd.Stop()
+	ready.Store(true)
 	klog.Info("driver started")
 
 	select {
@@ -96,7 +123,23 @@ func run() int {
 		klog.Infof("Exiting: received signal")
 		cancel()
 	case <-ctx.Done():
+		klog.Infof("Exiting: context cancelled")
 	}
+}
 
-	return 0
+func printVersion() {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	var vcsRevision, vcsTime string
+	for _, f := range info.Settings {
+		switch f.Key {
+		case "vcs.revision":
+			vcsRevision = f.Value
+		case "vcs.time":
+			vcsTime = f.Value
+		}
+	}
+	klog.Infof("%s go %s build: %s time: %s", driverName, info.GoVersion, vcsRevision, vcsTime)
 }

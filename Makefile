@@ -1,7 +1,6 @@
 REPO_ROOT:=${CURDIR}
 OUT_DIR=$(REPO_ROOT)/bin
-BINARY_NAME?=dra-network-driver
-
+BINARY_NAME?=simple-knd
 # disable CGO by default for static binaries
 CGO_ENABLED=0
 export GOROOT GO111MODULE CGO_ENABLED
@@ -23,9 +22,9 @@ update:
 	go mod tidy
 
 # get image name from directory we're building
-IMAGE_NAME=dra-network-driver
+IMAGE_NAME=simple-knd
 # docker image registry, default to upstream
-REGISTRY?=gcr.io/k8s-staging-networking
+REGISTRY?=aojea/simple-knd:stable
 IMAGE?=$(REGISTRY)/$(IMAGE_NAME)
 # tag based on date-sha
 TAG?=$(shell echo "$$(date +v%Y%m%d)-$$(git describe --always --dirty)")
