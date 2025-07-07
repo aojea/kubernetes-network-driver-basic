@@ -1,6 +1,6 @@
-# dra-network-driver-template
+# kubernetes-network-driver-basic
 
-A template repository for Kubernetes DRA Network Drivers
+A simple Kubernetes DRA Network Drivers that can be reused to implement more complex ones.
 
 The repository contains the following golang files:
 
@@ -8,18 +8,17 @@ The repository contains the following golang files:
 - `driver.go`: internal implementation details.
   - Initialize the dra and nri plugins
   - Hook on the Pod and DRA lifecycle and preprocess the ResourceClaims data to make it available to the developer hooks
-
-- `template.go`: developer code ** FILE TO BE MODIFIED **
-  - Define the driver name and constants used on the driver.
   - Define the discovery logic to publish the resources/devices available on the Node.
   - Define the executiong logic on the Pod.
 
+- `metrics.go`: define the metrics for the driver name.
+  
 In addition:
 
 - `Makefile` to automate some common tasks.
 - `Dockerfile` to build a container image with the driver code, use `make image` (the output image can be defined via env variable)
 - `install.yaml` manifest to install the dra driver (it uses the default image name)
-- `kind.yaml` allows to create a `KIND` cluster with the configuration required for DRA in Kubernetes 1.31
+- `kind.yaml` allows to create a `KIND` cluster with the configuration required for DRA in Kubernetes 1.33
   - `make kind-image` builds an image with the latest code and loads into the `KIND` cluster.
 
 ## Anatomy of a Networking DRA Driver
