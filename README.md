@@ -1,61 +1,223 @@
-# dra-network-driver-template
+# kubernetes-network-driver-basic
 
-A template repository for Kubernetes DRA Network Drivers
+A basic example implementation of a Kubernetes DRA (Dynamic Resource Allocation) Network Driver that can be used as a template for creating more sophisticated network drivers.
+
+## Overview
+
+This repository provides a complete, working example of a DRA network driver that discovers and manages network interfaces on a Kubernetes node. It demonstrates the integration between the DRA API and NRI (Node Resource Interface) to provide network devices to pods.
+
+## Repository Structure
 
 The repository contains the following golang files:
 
-- `main.go`: flag parsing and initialization code
-- `driver.go`: internal implementation details.
-  - Initialize the dra and nri plugins
-  - Hook on the Pod and DRA lifecycle and preprocess the ResourceClaims data to make it available to the developer hooks
+- `main.go`: Command-line flag parsing and driver initialization
+- `driver.go`: Complete driver implementation including:
+  - DRA plugin initialization and resource publishing
+  - NRI plugin integration for runtime hooks
+  - Pod lifecycle management and device allocation
+  - Network interface discovery and filtering
+  - Resource claim preparation and cleanup
 
-- `template.go`: developer code ** FILE TO BE MODIFIED **
-  - Define the driver name and constants used on the driver.
-  - Define the discovery logic to publish the resources/devices available on the Node.
-  - Define the executiong logic on the Pod.
+Additional files:
 
-In addition:
+- `driver_test.go`: Comprehensive unit tests for the driver implementation
+- `metrics.go`: Prometheus metrics for monitoring driver operations
+- `Makefile`: Automation for common development tasks
+- `Dockerfile`: Container image build configuration
+- `install.yaml`: Kubernetes manifest to deploy the driver as a DaemonSet
+- `kind.yaml`: KIND cluster configuration with DRA support enabled
 
-- `Makefile` to automate some common tasks.
-- `Dockerfile` to build a container image with the driver code, use `make image` (the output image can be defined via env variable)
-- `install.yaml` manifest to install the dra driver (it uses the default image name)
-- `kind.yaml` allows to create a `KIND` cluster with the configuration required for DRA in Kubernetes 1.31
-  - `make kind-image` builds an image with the latest code and loads into the `KIND` cluster.
+## Features
 
-## Anatomy of a Networking DRA Driver
+This example driver demonstrates:
 
-The networking DRA drivers uses GRPC to communicate with:
+### ✅ Network Device Discovery
+- Automatic discovery of host network interfaces
+- Filtering of virtual and container interfaces (docker, veth, cni, etc.)
+- Device attribute extraction (MAC address, MTU, IP addresses, interface flags)
+- Periodic resource publishing to the DRA framework
 
-- the Kubelet via the [DRA API](https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/kubelet/pkg/apis/dra/v1alpha4)
+### ✅ Resource Management
+- Resource claim preparation and validation
+- Device allocation tracking per pod
+- Cleanup on pod termination
+- Thread-safe device configuration storage
 
-- the Container Runtime via [NRI](https://github.com/containerd/nri).
+### ✅ Pod Integration
+- NRI hooks for container runtime integration
+- Network namespace detection and validation
+- Device configuration during pod startup
+- Cleanup during pod shutdown
 
-This architecture facilitates the supportability and reduces the complexity of the existing solutions, without having to deploy a third component and is also fully compatible and agnostic of the existing CNI plugins in the cluster.
+### ✅ Observability
+- Comprehensive logging with different verbosity levels
+- Prometheus metrics for monitoring
+- Performance timing for operations
+- Error tracking and reporting
 
-Networking DRA drivers authors need to define two business logic:
+## Usage as a Template
 
-- publishing node network devices: discovery the local resources on the node that the driver should announce with its attributes and capabilities.
+This implementation serves as a template for creating custom network drivers. To adapt it for your use case:
 
-- attaching the network devices: the Network Driver, before the Pod start to be created, will receive a GRPC call from the Kubelet using the DRA API with the details of the request associated to a Pod via a ResourceClaim object. Once the Pod network namespaces has been created, the driver will receive a GRPC call from the Container Runtime via NRI to execute the corresponding configuration. A more detailed diagram can be found in:
+### 1. Modify Device Discovery
+Update the `getNetworkDevices()` function to discover your specific network resources:
 
-### Pod creation
+```go
+func (nd *NetworkDriver) getNetworkDevices() ([]resourceapi.Device, error) {
+    // Replace with your device discovery logic
+    // Examples: SR-IOV VFs, DPDK devices, specialized NICs
+}
+```
 
-[![](https://mermaid.ink/img/pako:eNp9UstuwyAQ_JUVp1ZNfoBDpMi-WFXdyLn6gs0mQTXgLtCHovx714nTWoobDgiW2dlhNEfReo1CioDvCV2LuVF7UrZ2wEul6F2yDdLl_pwa7DAul6vVU4nx09Mb5NUacjIfSBJK5toQ9oqwwuATtRgeHi-9pY8InmEw1_naRGUcxAPCtTPrlLF8Y10hgnIaMu92Zj_S3ZAMqpajwvtSrt_gXzDlMBhJS6iS23i95UmN_7pi_wADf1YWEniDdZ6P72VxfpjwMEmxCXPts55VBRy8f5sff981xoMb605ZDL1qGd4jqWi8C_esmiqGG7FTK2eF_eNhRqgi_lbCjI1T6lu4WAiLZJXRHMrj0FwLToXFWkg-atyp1MVa1O7E0CGg22_XChkp4UKkXjPfmGEhd6oLXEVtoqeXS9DPeT_9ABUC_8M?type=png)](https://mermaid.live/edit#pako:eNp9UstuwyAQ_JUVp1ZNfoBDpMi-WFXdyLn6gs0mQTXgLtCHovx714nTWoobDgiW2dlhNEfReo1CioDvCV2LuVF7UrZ2wEul6F2yDdLl_pwa7DAul6vVU4nx09Mb5NUacjIfSBJK5toQ9oqwwuATtRgeHi-9pY8InmEw1_naRGUcxAPCtTPrlLF8Y10hgnIaMu92Zj_S3ZAMqpajwvtSrt_gXzDlMBhJS6iS23i95UmN_7pi_wADf1YWEniDdZ6P72VxfpjwMEmxCXPts55VBRy8f5sff981xoMb605ZDL1qGd4jqWi8C_esmiqGG7FTK2eF_eNhRqgi_lbCjI1T6lu4WAiLZJXRHMrj0FwLToXFWkg-atyp1MVa1O7E0CGg22_XChkp4UKkXjPfmGEhd6oLXEVtoqeXS9DPeT_9ABUC_8M)
+### 2. Implement Device Configuration
+Enhance the `configureDeviceForPod()` function to configure your devices:
 
-### Pod deletion
+```go
+func (nd *NetworkDriver) configureDeviceForPod(device AllocatedDevice, networkNamespace string, podSandbox *api.PodSandbox) error {
+    // Add your device configuration logic:
+    // - Move devices to pod namespace
+    // - Configure VLANs, VFs, or other features
+    // - Set up device-specific networking
+}
+```
 
-TODO
+### 3. Customize Filtering
+Modify the `shouldSkipInterface()` function for your device types:
 
+```go
+func (nd *NetworkDriver) shouldSkipInterface(name string) bool {
+    // Add logic to identify your manageable devices
+    // Return false for devices your driver should manage
+}
+```
 
-## Dynamic Resource Allocation Feedback (before beta)
+### 4. Add Device-Specific Attributes
+Extend the device attributes in `getNetworkDevices()`:
 
-- [ ] Driver MUST be able to report Status on the ResourceClaim
-  - [ ] Operation was successful or failed or ...
-  - [ ] Metadata associated to the operation: IP addresses, ...
-- [ ] Driver MUST not need to connect to the apiserver
-  - Right now the Claim is fetched from the apiserver to deal with skew versions problems, this behavior is undesired as the Pod creation operation must be atomic with the Kubelet "state of the world" informarion, once the API get more stable it should not be needed to fetch.
+```go
+device.Basic.Attributes["driver.mydriver/custom-attribute"] = resourceapi.DeviceAttribute{
+    StringValue: &customValue,
+}
+```
 
-## References
+## Architecture
 
-- [WG Device Management](https://github.com/kubernetes-sigs/wg-device-management)
-- [Kubernetes Network Drivers](https://docs.google.com/presentation/d/1Vdr7BhbYXeWjwmLjGmqnUkvJr_eOUdU0x-JxfXWxUT8/edit?usp=sharing)
+The driver implements a dual-API architecture:
+
+### DRA API Integration
+- **Resource Publishing**: Periodically discovers and publishes available network devices
+- **Claim Preparation**: Validates and prepares resource claims, storing device configuration
+- **Claim Cleanup**: Removes device allocations when claims are deleted
+
+### NRI Integration  
+- **Pod Lifecycle**: Hooks into container runtime for fast device configuration
+- **Network Namespace Management**: Configures devices in pod network namespaces
+- **Runtime Cleanup**: Removes device configuration when pods terminate
+
+## Quick Start
+
+### 1. Build and Deploy
+```bash
+# Build container image
+make image
+
+# Deploy to Kubernetes cluster with DRA support
+kubectl apply -f install.yaml
+```
+
+### 2. Create a ResourceClass
+```yaml
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClass
+metadata:
+  name: network-devices
+spec:
+  driver: network.example.com
+  parametersRef:
+    apiVersion: resource.k8s.io/v1beta1
+    kind: ResourceClassParameters
+    name: basic-network-config
+```
+
+### 3. Use in a Pod
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: network-pod
+spec:
+  resourceClaims:
+  - name: network-device
+    resourceClaimTemplateName: network-claim-template
+  containers:
+  - name: app
+    image: busybox
+    command: ["sleep", "3600"]
+---
+apiVersion: resource.k8s.io/v1beta1
+kind: ResourceClaimTemplate
+metadata:
+  name: network-claim-template
+spec:
+  spec:
+    devices:
+      requests:
+      - name: network-device
+        deviceClassName: network-devices
+```
+
+## Development
+
+### Running Tests
+```bash
+# Run all tests
+go test ./...
+
+# Run with coverage
+go test -cover ./...
+
+# Run benchmarks
+go test -bench=.
+```
+
+### Local Development with KIND
+```bash
+# Create KIND cluster with DRA support
+make kind-cluster
+
+# Build and load image into KIND
+make kind-image
+
+# Deploy driver
+kubectl apply -f install.yaml
+```
+
+## Monitoring
+
+The driver exposes Prometheus metrics at `/metrics`:
+
+- `network_driver_node_prepare_requests_total`: Total number of prepare requests
+- `network_driver_node_unprepare_requests_total`: Total number of unprepare requests  
+- `network_driver_published_devices`: Number of currently published devices
+
+## Requirements
+
+- Kubernetes 1.31+ with DRA feature gate enabled
+- Container runtime with NRI support (containerd, CRI-O)
+- Go 1.21+ for development
+
+## License
+
+Apache License 2.0
+
+## Contributing
+
+This is an example implementation. For production use cases, consider:
+
+- Adding comprehensive device validation
+- Implementing device health monitoring  
+- Adding support for device-specific configuration
+- Enhancing error handling and recovery
+- Adding integration tests with real workloads
+
+Feel free to use this as a starting point for your own DRA network driver implementations!

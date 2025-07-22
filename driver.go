@@ -341,6 +341,12 @@ func (nd *NetworkDriver) prepareResourceClaim(ctx context.Context, resourceClaim
 		return kubeletplugin.PrepareResult{}
 	}
 
+	if resourceClaim.Status.Allocation == nil ||
+		len(resourceClaim.Status.Allocation.Devices.Results) == 0 {
+		klog.Infof("claim %s/%s has no allocated devices", resourceClaim.Namespace, resourceClaim.Name)
+		return kubeletplugin.PrepareResult{}
+	}
+
 	var processingErrors []error
 	var allocatedDevicesForClaim []AllocatedDevice
 
