@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
@@ -18,6 +20,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -30,12 +33,29 @@ const (
 	maxAttempts = 5
 )
 
+// NetworkDriver implements the kubeletplugin.Driver interface
+// It manages network devices and integrates with the Dynamic Resource Allocation (DRA) framework.
+// It also implements the NRI plugin to manage network resources for pods.
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
 	kubeClient kubernetes.Interface
 	draPlugin  *kubeletplugin.Helper
 	nriPlugin  stub.Stub
+
+	// podDeviceConfig is a map that stores allocated network devices for each pod identified by its UID.
+	// The context of the map is to allow fast access to the allocated devices
+	// during pod lifecycle events, such as RunPodSandbox and StopPodSandbox.
+	mu              sync.Mutex                      // protects podDeviceConfig
+	podDeviceConfig map[types.UID][]AllocatedDevice // maps pod UID to allocated devices with attributes
+}
+
+// AllocatedDevice represents a network device allocated to a pod with its configuration
+type AllocatedDevice struct {
+	Name       string
+	Attributes map[string]string
+	PoolName   string
+	Request    string
 }
 
 type Option func(*NetworkDriver)
@@ -43,14 +63,15 @@ type Option func(*NetworkDriver)
 func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interface, nodeName string, opts ...Option) (*NetworkDriver, error) {
 	registerMetrics()
 
-	plugin := &NetworkDriver{
-		driverName: driverName,
-		nodeName:   nodeName,
-		kubeClient: kubeClient,
+	networkDriver := &NetworkDriver{
+		driverName:      driverName,
+		nodeName:        nodeName,
+		kubeClient:      kubeClient,
+		podDeviceConfig: make(map[types.UID][]AllocatedDevice),
 	}
 
-	for _, o := range opts {
-		o(plugin)
+	for _, option := range opts {
+		option(networkDriver)
 	}
 
 	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)
@@ -59,29 +80,30 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		return nil, fmt.Errorf("failed to create plugin path %s: %v", driverPluginPath, err)
 	}
 
-	kubeletOpts := []kubeletplugin.Option{
+	kubeletOptions := []kubeletplugin.Option{
 		kubeletplugin.DriverName(driverName),
 		kubeletplugin.NodeName(nodeName),
 		kubeletplugin.KubeClient(kubeClient),
 	}
-	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
+	draHelper, err := kubeletplugin.Start(ctx, networkDriver, kubeletOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("start kubelet plugin: %w", err)
 	}
-	plugin.draPlugin = d
+	networkDriver.draPlugin = draHelper
+
 	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second, true, func(context.Context) (bool, error) {
-		status := plugin.draPlugin.RegistrationStatus()
-		if status == nil {
+		registrationStatus := networkDriver.draPlugin.RegistrationStatus()
+		if registrationStatus == nil {
 			return false, nil
 		}
-		return status.PluginRegistered, nil
+		return registrationStatus.PluginRegistered, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	// register the NRI plugin
-	nriOpts := []stub.Option{
+	nriOptions := []stub.Option{
 		stub.WithPluginName(driverName),
 		stub.WithPluginIdx("00"),
 		// https://github.com/containerd/nri/pull/173
@@ -90,15 +112,15 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			klog.Infof("%s NRI plugin closed", driverName)
 		}),
 	}
-	stub, err := stub.New(plugin, nriOpts...)
+	nriStub, err := stub.New(networkDriver, nriOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create plugin stub: %v", err)
 	}
-	plugin.nriPlugin = stub
+	networkDriver.nriPlugin = nriStub
 
 	go func() {
-		for i := 0; i < maxAttempts; i++ {
-			err = plugin.nriPlugin.Run(ctx)
+		for attemptCount := 0; attemptCount < maxAttempts; attemptCount++ {
+			err = networkDriver.nriPlugin.Run(ctx)
 			if err != nil {
 				klog.Infof("NRI plugin failed with error %v", err)
 			}
@@ -106,53 +128,178 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 			case <-ctx.Done():
 				return
 			default:
-				klog.Infof("Restarting NRI plugin %d out of %d", i, maxAttempts)
+				klog.Infof("Restarting NRI plugin %d out of %d", attemptCount, maxAttempts)
 			}
 		}
 		klog.Fatalf("NRI plugin failed for %d times to be restarted", maxAttempts)
 	}()
 
 	// publish available resources
-	go plugin.PublishResources(ctx)
+	go networkDriver.PublishResources(ctx)
 
-	return plugin, nil
+	return networkDriver, nil
 }
 
-func (np *NetworkDriver) Stop() {
-	np.nriPlugin.Stop()
-	np.draPlugin.Stop()
+func (nd *NetworkDriver) Stop() {
+	klog.Info("Stopping network driver...")
+
+	// Stop NRI plugin first
+	if nd.nriPlugin != nil {
+		nd.nriPlugin.Stop()
+	}
+
+	// Stop DRA plugin
+	if nd.draPlugin != nil {
+		nd.draPlugin.Stop()
+	}
+
+	klog.Info("Network driver stopped")
 }
 
-func (np *NetworkDriver) Shutdown(_ context.Context) {
+func (nd *NetworkDriver) Shutdown(_ context.Context) {
 	klog.Info("Runtime shutting down...")
 }
 
-func (np *NetworkDriver) PublishResources(ctx context.Context) {
+// DRA hooks exposes Network Devices to Kubernetes
+// and allows the kubelet to discover and use them as resources for pods.
+
+// PublishResources periodically discovers network devices and publishes them as resources
+// to the DRA plugin.
+func (nd *NetworkDriver) PublishResources(ctx context.Context) {
 	klog.V(2).Infof("Publishing resources")
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			klog.Error(ctx.Err(), "context canceled")
 			return
-		default:
-		}
+		case <-ticker.C:
+			devices, err := nd.getNetworkDevices()
+			if err != nil {
+				klog.Error(err, "failed to get network devices")
+				continue
+			}
 
-		devices := []resourceapi.Device{}
-		resources := resourceslice.DriverResources{
-			Pools: map[string]resourceslice.Pool{
-				np.nodeName: {Slices: []resourceslice.Slice{{Devices: devices}}}},
-		}
-		err := np.draPlugin.PublishResources(ctx, resources)
-		if err != nil {
-			klog.Error(err, "unexpected error trying to publish resources")
-		}
+			resources := resourceslice.DriverResources{
+				Pools: map[string]resourceslice.Pool{
+					nd.nodeName: {Slices: []resourceslice.Slice{{Devices: devices}}},
+				},
+			}
 
-		// poor man rate limit
-		time.Sleep(3 * time.Second)
+			if err := nd.draPlugin.PublishResources(ctx, resources); err != nil {
+				klog.Error(err, "unexpected error trying to publish resources")
+			} else {
+				klog.V(2).Infof("Published %d network devices", len(devices))
+			}
+		}
 	}
 }
 
-func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
+// getNetworkDevices discovers all network interfaces on the host and returns them as DRA devices.
+// This is an example implementation that retrieves network interfaces,
+// filters out loopback and down interfaces, and skips common virtual interfaces used by containers.
+// It returns a slice of resourceapi.Device representing the available network devices.
+// Each device includes attributes like interface name, MAC address, MTU, and IP addresses.
+func (nd *NetworkDriver) getNetworkDevices() ([]resourceapi.Device, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get network interfaces: %w", err)
+	}
+
+	var devices []resourceapi.Device
+
+	for _, iface := range interfaces {
+		// Skip loopback and down interfaces
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		// Skip virtual interfaces commonly used by containers/kubernetes
+		if nd.shouldSkipInterface(iface.Name) {
+			continue
+		}
+
+		device := resourceapi.Device{
+			Name: iface.Name,
+			Basic: &resourceapi.BasicDevice{
+				Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+					"interface-name": {
+						StringValue: &iface.Name,
+					},
+					"mac-address": {
+						StringValue: ptr.To(iface.HardwareAddr.String()),
+					},
+					"mtu": {
+						IntValue: func() *int64 {
+							mtu := int64(iface.MTU)
+							return &mtu
+						}(),
+					},
+					"flags": {
+						StringValue: func() *string {
+							flags := iface.Flags.String()
+							return &flags
+						}(),
+					},
+				},
+			},
+		}
+
+		// Add IP addresses if available
+		addrs, err := iface.Addrs()
+		if err == nil && len(addrs) > 0 {
+			var ipAddresses []string
+			for _, addr := range addrs {
+				ipAddresses = append(ipAddresses, addr.String())
+			}
+			if len(ipAddresses) > 0 {
+				ipList := fmt.Sprintf("%v", ipAddresses)
+				device.Basic.Attributes["ip-addresses"] = resourceapi.DeviceAttribute{
+					StringValue: &ipList,
+				}
+			}
+		}
+
+		devices = append(devices, device)
+		klog.V(4).Infof("Discovered network device: %s (MAC: %s, MTU: %d)",
+			iface.Name, iface.HardwareAddr.String(), iface.MTU)
+	}
+
+	return devices, nil
+}
+
+// shouldSkipInterface determines if a network interface should be skipped
+func (nd *NetworkDriver) shouldSkipInterface(name string) bool {
+	// Skip common virtual interfaces
+	skipPrefixes := []string{
+		"docker",
+		"br-",
+		"veth",
+		"cni",
+		"flannel",
+		"weave",
+		"cali",
+		"kube",
+		"virbr",
+		"vmnet",
+	}
+
+	for _, prefix := range skipPrefixes {
+		if len(name) >= len(prefix) && name[:len(prefix)] == prefix {
+			return true
+		}
+	}
+
+	return false
+}
+
+// The hooks NodePrepareResources and NodeUnprepareResources are needed to collect the necessary
+// information so the NRI hooks can perform the configuration and attachment of Pods at runtime.
+
+// PrepareResourceClaims is called by the kubelet to prepare resource claims for pods.
+func (nd *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
 	klog.V(2).Infof("PrepareResourceClaims is called: number of claims: %d", len(claims))
 
 	nodePrepareRequestsTotal.Inc()
@@ -164,7 +311,7 @@ func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*re
 
 	for _, claim := range claims {
 		klog.V(2).Infof("NodePrepareResources: Claim Request %s/%s", claim.Namespace, claim.Name)
-		result[claim.UID] = np.prepareResourceClaim(ctx, claim)
+		result[claim.UID] = nd.prepareResourceClaim(ctx, claim)
 	}
 	return result, nil
 }
@@ -172,55 +319,141 @@ func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*re
 // prepareResourceClaim gets all the configuration required to be applied at runtime and passes it downs to the handlers.
 // This happens in the kubelet so it can be a "slow" operation, so we can execute fast in RunPodsandbox, that happens in the
 // container runtime and has strong expectactions to be executed fast (default hook timeout is 2 seconds).
-func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
-	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
-	start := time.Now()
+func (nd *NetworkDriver) prepareResourceClaim(ctx context.Context, resourceClaim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
+	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", resourceClaim.Namespace, resourceClaim.Name)
+	startTime := time.Now()
 	defer func() {
-		klog.V(2).Infof("PrepareResourceClaim Claim %s/%s  took %v", claim.Namespace, claim.Name, time.Since(start))
+		klog.V(2).Infof("PrepareResourceClaim Claim %s/%s took %v", resourceClaim.Namespace, resourceClaim.Name, time.Since(startTime))
 	}()
-	// TODO: shared devices may allocate the same device to multiple pods, i.e. macvlan, ipvlan, ...
-	podUIDs := []types.UID{}
-	for _, reserved := range claim.Status.ReservedFor {
-		if reserved.Resource != "pods" || reserved.APIGroup != "" {
-			klog.Infof("Driver only supports Pods, unsupported reference %#v", reserved)
+
+	// Extract pod UIDs that this claim is reserved for
+	allocatedPodUIDs := []types.UID{}
+	for _, reservedReference := range resourceClaim.Status.ReservedFor {
+		if reservedReference.Resource != "pods" || reservedReference.APIGroup != "" {
+			klog.Infof("Driver only supports Pods, unsupported reference %#v", reservedReference)
 			continue
 		}
-		podUIDs = append(podUIDs, reserved.UID)
+		allocatedPodUIDs = append(allocatedPodUIDs, reservedReference.UID)
 	}
-	if len(podUIDs) == 0 {
-		klog.Infof("no pods allocated to claim %s/%s", claim.Namespace, claim.Name)
+
+	if len(allocatedPodUIDs) == 0 {
+		klog.Infof("no pods allocated to claim %s/%s", resourceClaim.Namespace, resourceClaim.Name)
 		return kubeletplugin.PrepareResult{}
 	}
 
-	var errorList []error
+	var processingErrors []error
+	var allocatedDevicesForClaim []AllocatedDevice
 
-	if len(errorList) > 0 {
-		klog.Infof("claim %s contain errors: %v", claim.UID, errors.Join(errorList...))
+	// Process each allocated device
+	for _, allocationResult := range resourceClaim.Status.Allocation.Devices.Results {
+		if allocationResult.Driver != nd.driverName {
+			continue
+		}
+
+		// Get device attributes from published resources
+		deviceAttributes, err := nd.getDeviceAttributes(allocationResult.Device)
+		if err != nil {
+			processingErrors = append(processingErrors, fmt.Errorf("failed to get attributes for device %s: %w", allocationResult.Device, err))
+			continue
+		}
+
+		allocatedDevice := AllocatedDevice{
+			Name:       allocationResult.Device,
+			Attributes: deviceAttributes,
+			PoolName:   allocationResult.Pool,
+			Request:    allocationResult.Request,
+		}
+
+		allocatedDevicesForClaim = append(allocatedDevicesForClaim, allocatedDevice)
+		klog.V(2).Infof("Prepared device %s for claim %s/%s with attributes: %v",
+			allocationResult.Device, resourceClaim.Namespace, resourceClaim.Name, deviceAttributes)
+	}
+
+	// Store device configuration for all allocated pods
+	nd.mu.Lock()
+	for _, podUID := range allocatedPodUIDs {
+		if nd.podDeviceConfig[podUID] == nil {
+			nd.podDeviceConfig[podUID] = []AllocatedDevice{}
+		}
+		nd.podDeviceConfig[podUID] = append(nd.podDeviceConfig[podUID], allocatedDevicesForClaim...)
+		klog.V(2).Infof("Stored device configuration for pod UID %s: %d devices", podUID, len(allocatedDevicesForClaim))
+	}
+	nd.mu.Unlock()
+
+	if len(processingErrors) > 0 {
+		klog.Infof("claim %s contains errors: %v", resourceClaim.UID, errors.Join(processingErrors...))
 		return kubeletplugin.PrepareResult{
-			Err: fmt.Errorf("claim %s contain errors: %w", claim.UID, errors.Join(errorList...)),
+			Err: fmt.Errorf("claim %s contains errors: %w", resourceClaim.UID, errors.Join(processingErrors...)),
 		}
 	}
+
 	return kubeletplugin.PrepareResult{}
 }
 
-func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
+// getDeviceAttributes retrieves device attributes for a given device name
+func (nd *NetworkDriver) getDeviceAttributes(deviceName string) (map[string]string, error) {
+	// Get fresh device list to find attributes
+	availableDevices, err := nd.getNetworkDevices()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get network devices: %w", err)
+	}
+
+	for _, device := range availableDevices {
+		if device.Name == deviceName {
+			deviceAttributes := make(map[string]string)
+			for attributeName, attributeValue := range device.Basic.Attributes {
+				if attributeValue.StringValue != nil {
+					deviceAttributes[string(attributeName)] = *attributeValue.StringValue
+				} else if attributeValue.IntValue != nil {
+					deviceAttributes[string(attributeName)] = fmt.Sprintf("%d", *attributeValue.IntValue)
+				}
+			}
+			return deviceAttributes, nil
+		}
+	}
+
+	return nil, fmt.Errorf("device %s not found in available devices", deviceName)
+}
+
+func (nd *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
 	klog.V(2).Infof("UnprepareResourceClaims is called: number of claims: %d", len(claims))
+
 	if len(claims) == 0 {
 		return nil, nil
 	}
 
 	result := make(map[types.UID]error)
+
 	for _, claim := range claims {
-		err := np.unprepareResourceClaim(ctx, claim)
-		result[claim.UID] = err
-		if err != nil {
-			klog.Infof("error unpreparing ressources for claim %s/%s : %v", claim.Namespace, claim.Name, err)
-		}
+		klog.V(2).Infof("UnprepareResourceClaim: Claim UID %s", claim.UID)
+		result[claim.UID] = nd.unprepareResourceClaim(ctx, claim)
 	}
+
 	return result, nil
 }
 
-func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
+// unprepareResourceClaim cleans up resources allocated by a claim
+func (nd *NetworkDriver) unprepareResourceClaim(ctx context.Context, claim kubeletplugin.NamespacedObject) error {
+	klog.V(2).Infof("UnprepareResourceClaim Claim UID %s", claim.UID)
+	startTime := time.Now()
+	defer func() {
+		klog.V(2).Infof("UnprepareResourceClaim Claim UID %s took %v", claim.UID, time.Since(startTime))
+	}()
+
+	// Find and remove any pod device configurations associated with this claim
+	nd.mu.Lock()
+	defer nd.mu.Unlock()
+
+	var removedDevices int
+	for podUID, devices := range nd.podDeviceConfig {
+		// Note: In a real implementation, you'd need to track which claim
+		// allocated which devices. For now, we'll just log this operation.
+		klog.V(2).Infof("Pod UID %s has %d allocated devices", podUID, len(devices))
+		// In practice, you might filter devices by claim or other criteria here
+	}
+
+	klog.V(2).Infof("UnprepareResourceClaim completed for claim UID %s, removed %d device allocations", claim.UID, removedDevices)
+
 	return nil
 }
 
@@ -230,7 +463,11 @@ func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubelet
 // The NRI hooks are time sensitive, any slow operation needs to be added on the DRA hooks and only
 // the information necessary should passed to the NRI hooks via the np.podConfigStore so it can be executed
 // quickly.
-
+// Synchronize is called to synchronize the state of pods and containers with the runtime.
+// It is called when the runtime starts or when the kubelet restarts.
+// It should not perform any operations that take a long time, as it is expected to return quickly.
+// Instead, it should only gather the necessary information to be used later in the lifecycle of the Pod.
+// This is a good place to store the Pod metadata in the np.podConfigStore so it can be used later in the lifecycle of the Pod.
 func (np *NetworkDriver) Synchronize(_ context.Context, pods []*api.PodSandbox, containers []*api.Container) ([]*api.ContainerUpdate, error) {
 	klog.Infof("Synchronized state with the runtime (%d pods, %d containers)...",
 		len(pods), len(containers))
@@ -256,43 +493,133 @@ func (np *NetworkDriver) CreateContainer(_ context.Context, pod *api.PodSandbox,
 	return nil, nil, nil
 }
 
-func (np *NetworkDriver) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
-	start := time.Now()
+// RunPodSandbox is called when a pod sandbox is started.
+// It configures the allocated network devices for the pod based on its network namespace.
+func (nd *NetworkDriver) RunPodSandbox(ctx context.Context, podSandbox *api.PodSandbox) error {
+	klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s", podSandbox.Namespace, podSandbox.Name, podSandbox.Uid)
+	startTime := time.Now()
 	defer func() {
-		klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s took %v", pod.Namespace, pod.Name, pod.Uid, time.Since(start))
+		klog.V(2).Infof("RunPodSandbox Pod %s/%s UID %s took %v", podSandbox.Namespace, podSandbox.Name, podSandbox.Uid, time.Since(startTime))
 	}()
-	ns := getNetworkNamespace(pod)
-	// host network pods can not allocate network devices because it impact the host
-	if ns == "" {
-		return fmt.Errorf("RunPodSandbox pod %s/%s using host network can not claim host devices", pod.Namespace, pod.Name)
+
+	networkNamespace := getNetworkNamespace(podSandbox)
+	// host network pods cannot allocate network devices because it impacts the host
+	if networkNamespace == "" {
+		return fmt.Errorf("RunPodSandbox pod %s/%s using host network cannot claim host devices", podSandbox.Namespace, podSandbox.Name)
+	}
+
+	// Get allocated devices for this pod
+	podUID := types.UID(podSandbox.Uid)
+	nd.mu.Lock()
+	allocatedDevices := nd.podDeviceConfig[podUID]
+	nd.mu.Unlock()
+
+	if len(allocatedDevices) == 0 {
+		klog.V(2).Infof("No network devices allocated to pod %s/%s", podSandbox.Namespace, podSandbox.Name)
+		return nil
+	}
+
+	klog.V(2).Infof("Processing %d allocated network devices for pod %s/%s",
+		len(allocatedDevices), podSandbox.Namespace, podSandbox.Name)
+
+	// Process each allocated device
+	for _, allocatedDevice := range allocatedDevices {
+		err := nd.configureDeviceForPod(allocatedDevice, networkNamespace, podSandbox)
+		if err != nil {
+			return fmt.Errorf("failed to configure device %s for pod %s/%s: %w",
+				allocatedDevice.Name, podSandbox.Namespace, podSandbox.Name, err)
+		}
+
+		klog.V(2).Infof("Successfully configured device %s for pod %s/%s in namespace %s",
+			allocatedDevice.Name, podSandbox.Namespace, podSandbox.Name, networkNamespace)
 	}
 
 	return nil
 }
 
-// StopPodSandbox tries to move back the devices to the rootnamespace but does not fail
-// to avoid disrupting the pod shutdown. The kernel will do the cleanup once the namespace
-// is deleted.
-func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
-	start := time.Now()
-	defer func() {
-		klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s took %v", pod.Namespace, pod.Name, pod.Uid, time.Since(start))
-	}()
-	// get the pod network namespace
-	ns := getNetworkNamespace(pod)
-	if ns == "" {
-		// some version of containerd does not send the network namespace information on this hook so
-		// we workaround it using the local copy we have in the db to associate interfaces with Pods via
-		// the network namespace id.
+// configureDeviceForPod configures a network device for use by a pod
+func (nd *NetworkDriver) configureDeviceForPod(device AllocatedDevice, networkNamespace string, podSandbox *api.PodSandbox) error {
+	// TODO: Implement actual device configuration logic here
+	// This could include:
+	// - Moving the device to the pod's network namespace
+	// - Setting up VLAN/MACVLAN/etc. based on device attributes
+	// - Configuring IP addresses if needed
+	// - Setting up routing rules
+
+	klog.V(2).Infof("Configuring device %s with attributes %v for pod %s/%s in namespace %s",
+		device.Name, device.Attributes, podSandbox.Namespace, podSandbox.Name, networkNamespace)
+
+	// Example configuration based on device attributes:
+	if macAddress, exists := device.Attributes["mac-address"]; exists {
+		klog.V(2).Infof("Device %s has MAC address: %s", device.Name, macAddress)
+	}
+
+	if mtu, exists := device.Attributes["mtu"]; exists {
+		klog.V(2).Infof("Device %s has MTU: %s", device.Name, mtu)
 	}
 
 	return nil
 }
 
-func (np *NetworkDriver) RemovePodSandbox(_ context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("RemovePodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
+// StopPodSandbox is called when a pod sandbox is stopped.
+// It cleans up the allocated network devices for the pod.
+func (nd *NetworkDriver) StopPodSandbox(ctx context.Context, podSandbox *api.PodSandbox) error {
+	klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s", podSandbox.Namespace, podSandbox.Name, podSandbox.Uid)
+
+	networkNamespace := getNetworkNamespace(podSandbox)
+	if networkNamespace == "" {
+		klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s Network Namespace %s",
+			podSandbox.Namespace, podSandbox.Name, podSandbox.Uid, networkNamespace)
+	}
+
+	// Get allocated devices for cleanup
+	podUID := types.UID(podSandbox.Uid)
+	nd.mu.Lock()
+	allocatedDevices := nd.podDeviceConfig[podUID]
+	nd.mu.Unlock()
+
+	if len(allocatedDevices) > 0 {
+		klog.V(2).Infof("Cleaning up %d network devices for pod %s/%s",
+			len(allocatedDevices), podSandbox.Namespace, podSandbox.Name)
+
+		for _, device := range allocatedDevices {
+			err := nd.cleanupDeviceForPod(device, networkNamespace, podSandbox)
+			if err != nil {
+				// Log error but don't fail - kernel will cleanup when namespace is deleted
+				klog.Errorf("Failed to cleanup device %s for pod %s/%s: %v",
+					device.Name, podSandbox.Namespace, podSandbox.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// RemovePodSandbox is called when a pod sandbox is removed.
+func (nd *NetworkDriver) RemovePodSandbox(_ context.Context, podSandbox *api.PodSandbox) error {
+	klog.V(2).Infof("RemovePodSandbox Pod %s/%s UID %s", podSandbox.Namespace, podSandbox.Name, podSandbox.Uid)
+
+	// Clean up stored device configuration
+	podUID := types.UID(podSandbox.Uid)
+	nd.mu.Lock()
+	delete(nd.podDeviceConfig, podUID)
+	nd.mu.Unlock()
+
+	klog.V(2).Infof("Removed device configuration for pod %s/%s", podSandbox.Namespace, podSandbox.Name)
+	return nil
+}
+
+// cleanupDeviceForPod cleans up a network device when a pod is stopped
+func (nd *NetworkDriver) cleanupDeviceForPod(device AllocatedDevice, networkNamespace string, podSandbox *api.PodSandbox) error {
+	// TODO: Implement actual device cleanup logic here
+	// This could include:
+	// - Moving the device back to the host network namespace
+	// - Removing VLAN/MACVLAN interfaces
+	// - Cleaning up routing rules
+
+	klog.V(2).Infof("Cleaning up device %s for pod %s/%s",
+		device.Name, podSandbox.Namespace, podSandbox.Name)
+
 	return nil
 }
 

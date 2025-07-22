@@ -22,7 +22,7 @@ function setup_suite {
 
   _install=$(sed s#"$IMAGE_NAME".*#"$IMAGE_NAME":test# < "$BATS_TEST_DIRNAME"/../install.yaml)
   printf '%s' "${_install}" | kubectl apply -f -
-  kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=dranet
+  kubectl wait --for=condition=ready pods --namespace=kube-system -l k8s-app=simple-knd
 
   # Expose a webserver in the default namespace
   kubectl run web --image=httpd:2 --labels="app=web" --expose --port=80

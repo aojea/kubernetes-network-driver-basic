@@ -10,7 +10,7 @@ var registerMetricsOnce sync.Once
 
 var (
 	nodePrepareRequestsTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "dranet",
+		Namespace: "kubernetes-networking",
 		Subsystem: "driver",
 		Name:      "node_prepare_requests_total",
 		Help:      "Total number of NodePrepareResources requests received.",
