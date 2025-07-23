@@ -15,10 +15,11 @@ spec:
   devices:
     requests:
     - name: dummy
-      deviceClassName: dra-dummy-interfaces-class
-      selectors:
-        - cel:
-            expression: device.attributes["simple-knd"].name == "dummy0"
+      exactly:
+        deviceClassName: dra-dummy-interfaces-class
+        selectors:
+          - cel:
+              expression: device.attributes["simple-knd"].name == "dummy0"
 ---
 apiVersion: v1
 kind: Pod

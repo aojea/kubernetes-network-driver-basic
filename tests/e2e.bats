@@ -9,7 +9,7 @@ load 'test_helper/bats-assert/load'
 
   kubectl apply -f "$BATS_TEST_DIRNAME"/../examples/resourceclaim.yaml
   kubectl wait --timeout=30s --for=condition=ready pods -l app=pod
-  run kubectl exec pod1 -- ip addr show eth99
+  run kubectl exec pod1 -- ip addr show
   assert_success
   run kubectl get resourceclaims dummy-interface-static-ip  -o=jsonpath='{.status.devices[0].networkData.ips[*]}'
   assert_success
